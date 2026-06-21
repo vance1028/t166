@@ -193,3 +193,37 @@ CREATE TABLE IF NOT EXISTS stock_count_items (
   INDEX idx_stock_count_item_count (count_id),
   INDEX idx_stock_count_item_ingredient (ingredient_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 采购单
+CREATE TABLE IF NOT EXISTS purchase_orders (
+  id                INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+  canteen_id        INT UNSIGNED NOT NULL,
+  order_no          VARCHAR(32) NOT NULL UNIQUE,
+  status            VARCHAR(16) NOT NULL DEFAULT 'DRAFT',
+  order_date        DATE NOT NULL,
+  expected_date     DATE NULL,
+  total_qty         DECIMAL(12,2) NOT NULL DEFAULT 0,
+  total_amount_cents INT NOT NULL DEFAULT 0,
+  remark            VARCHAR(255) NOT NULL DEFAULT '',
+  created_at        DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at        DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  CONSTRAINT fk_purchase_order_canteen FOREIGN KEY (canteen_id) REFERENCES canteens(id) ON DELETE CASCADE,
+  INDEX idx_purchase_order_status (status),
+  INDEX idx_purchase_order_date (order_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 采购单明细
+CREATE TABLE IF NOT EXISTS purchase_order_items (
+  id                INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+  order_id          INT UNSIGNED NOT NULL,
+  ingredient_id     INT UNSIGNED NOT NULL,
+  qty               DECIMAL(10,2) NOT NULL,
+  unit_price_cents  INT NOT NULL DEFAULT 0,
+  received_qty      DECIMAL(10,2) NOT NULL DEFAULT 0,
+  amount_cents      INT NOT NULL DEFAULT 0,
+  remark            VARCHAR(255) NOT NULL DEFAULT '',
+  CONSTRAINT fk_po_item_order FOREIGN KEY (order_id) REFERENCES purchase_orders(id) ON DELETE CASCADE,
+  CONSTRAINT fk_po_item_ingredient FOREIGN KEY (ingredient_id) REFERENCES ingredients(id),
+  INDEX idx_po_item_order (order_id),
+  INDEX idx_po_item_ingredient (ingredient_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

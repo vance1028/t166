@@ -43,7 +43,7 @@ function explodeBom(dishDemand, recipesByDish) {
           totalQty: 0,
         };
       }
-      result[iid].totalQty += subTotal;
+      result[iid].totalQty = Math.round((result[iid].totalQty + subTotal) * 1000) / 1000;
     }
   }
 
@@ -108,8 +108,7 @@ function calcPurchaseSuggestion(demandByIngredient, stockByIngredient, ingredien
     const afterConsume = currentStock - demandQty;
     const shortageQty = Math.max(0, demandQty - currentStock);
 
-    const needToSafety = safetyStock - afterConsume;
-    const rawSuggestQty = Math.max(0, shortageQty, needToSafety > 0 ? shortageQty + safetyStock - currentStock : 0);
+    const requiredPurchase = Math.max(0, demandQty + safetyStock - currentStock);
 
     let status = 'ENOUGH';
     if (shortageQty > 0) {
@@ -120,11 +119,8 @@ function calcPurchaseSuggestion(demandByIngredient, stockByIngredient, ingredien
 
     let suggestOrderQty = 0;
     if (status !== 'ENOUGH') {
-      const needed = Math.max(shortageQty + Math.max(0, safetyStock - afterConsume), minOrderQty);
+      const needed = Math.max(requiredPurchase, minOrderQty);
       suggestOrderQty = roundUpByPack(needed, packageSpec);
-      if (suggestOrderQty < minOrderQty) {
-        suggestOrderQty = roundUpByPack(minOrderQty, packageSpec);
-      }
     }
 
     suggestions.push({
@@ -134,8 +130,9 @@ function calcPurchaseSuggestion(demandByIngredient, stockByIngredient, ingredien
       demandQty,
       currentStock,
       safetyStock,
+      afterConsume,
       shortageQty,
-      rawSuggestQty: rawSuggestQty,
+      requiredPurchase,
       suggestOrderQty,
       packageSpec,
       minOrderQty,

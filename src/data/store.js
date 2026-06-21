@@ -57,6 +57,14 @@ function mapStockCountItem(r) {
   if (!r) return null;
   return { id: r.id, countId: r.count_id, ingredientId: r.ingredient_id, theoreticalQty: Number(r.theoretical_qty), actualQty: Number(r.actual_qty), diffQty: Number(r.diff_qty), unitPriceCents: r.unit_price_cents, diffAmountCents: r.diff_amount_cents, remark: r.remark };
 }
+function mapPurchaseOrder(r) {
+  if (!r) return null;
+  return { id: r.id, canteenId: r.canteen_id, orderNo: r.order_no, status: r.status, orderDate: r.order_date, expectedDate: r.expected_date, totalQty: Number(r.total_qty), totalAmountCents: r.total_amount_cents, remark: r.remark, createdAt: r.created_at, updatedAt: r.updated_at };
+}
+function mapPurchaseOrderItem(r) {
+  if (!r) return null;
+  return { id: r.id, orderId: r.order_id, ingredientId: r.ingredient_id, qty: Number(r.qty), unitPriceCents: r.unit_price_cents, receivedQty: Number(r.received_qty), amountCents: r.amount_cents, remark: r.remark };
+}
 
 /* ----------------------------- 用户 ----------------------------- */
 async function getUserByUsername(u) { const [r] = await getPool().query('SELECT * FROM users WHERE username=?', [u]); return mapUserWithHash(r[0]); }
@@ -426,9 +434,9 @@ async function stockOut({ canteenId, ingredientId, qty, refType = 'CONSUME', ref
     const batches = batchesRaw.map(mapStockBatch);
     const result = invLogic.fifoDeduct(batches, qty, today);
 
-    if (!result.success && result.totalDeducted === 0) {
+    if (!result.success) {
       await conn.rollback();
-      return { success: false, deductions: [], totalCostCents: 0, remainingNeed: qty, reason: '库存不足' };
+      return { success: false, deductions: [], totalCostCents: 0, totalDeducted: 0, remainingNeed: qty, reason: '库存不足' };
     }
 
     for (const ded of result.deductions) {
@@ -439,11 +447,12 @@ async function stockOut({ canteenId, ingredientId, qty, refType = 'CONSUME', ref
       );
     }
 
-    const [sumRow] = await conn.query(
-      'SELECT COALESCE(SUM(remaining_qty), 0) AS total FROM stock_batches WHERE canteen_id=? AND ingredient_id=? AND status=?',
-      [canteenId, ingredientId, 'IN_STOCK']
-    );
-    let runningBalance = Number(sumRow[0].total);
+    let runningBalance = 0;
+    for (let i = 0; i < result.deductions.length; i += 1) {
+      const ded = result.deductions[i];
+      const ub = result.updatedBatches.find(b => b.id === ded.batchId);
+      runningBalance += ub.remainingQty;
+    }
 
     for (let i = result.deductions.length - 1; i >= 0; i -= 1) {
       const ded = result.deductions[i];
@@ -457,11 +466,11 @@ async function stockOut({ canteenId, ingredientId, qty, refType = 'CONSUME', ref
 
     await conn.commit();
     return {
-      success: result.success,
+      success: true,
       deductions: result.deductions,
       totalDeducted: result.totalDeducted,
       totalCostCents: result.totalCostCents,
-      remainingNeed: result.remainingNeed,
+      remainingNeed: 0,
     };
   } catch (e) {
     await conn.rollback();
@@ -508,9 +517,9 @@ async function getStockQty(canteenId, ingredientId) {
 
 /* ----------------------------- 临期过期预警 ----------------------------- */
 async function getExpiryWarnings(canteenId, warningDays = 7, ingredientId) {
-  const w = ['canteen_id=?', 'status=?', 'remaining_qty > 0'];
+  const w = ['b.canteen_id=?', 'b.status=?', 'b.remaining_qty > 0'];
   const p = [canteenId, 'IN_STOCK'];
-  if (ingredientId !== undefined) { w.push('ingredient_id=?'); p.push(ingredientId); }
+  if (ingredientId !== undefined) { w.push('b.ingredient_id=?'); p.push(ingredientId); }
   const c = `WHERE ${w.join(' AND ')}`;
   const [r] = await getPool().query(
     `SELECT b.*, i.name AS ingredient_name, i.unit AS unit
@@ -547,16 +556,18 @@ async function createStockCount(canteenId, countDate, remark = '') {
     );
     const countId = x.insertId;
 
+    const countD = new Date(countDate);
     const [ingRows] = await conn.query(
       `SELECT b.ingredient_id, i.name AS ingredient_name, i.unit AS unit,
               SUM(b.remaining_qty) AS theoretical_qty,
-              b.unit_price_cents AS unit_price_cents
+              ROUND(SUM(b.remaining_qty * b.unit_price_cents) / SUM(b.remaining_qty)) AS unit_price_cents
        FROM stock_batches b
        LEFT JOIN ingredients i ON i.id = b.ingredient_id
        WHERE b.canteen_id=? AND b.status=?
-       GROUP BY b.ingredient_id
+         AND (b.expire_date IS NULL OR b.expire_date >= ?)
+       GROUP BY b.ingredient_id, i.name, i.unit
        HAVING theoretical_qty > 0`,
-      [canteenId, 'IN_STOCK']
+      [canteenId, 'IN_STOCK', countD.toISOString().slice(0, 10)]
     );
 
     for (const row of ingRows) {
@@ -645,6 +656,7 @@ async function confirmStockCount(countId) {
     }
 
     const [items] = await conn.query('SELECT * FROM stock_count_items WHERE count_id=?', [countId]);
+    const countDate = sc.count_date ? new Date(sc.count_date) : new Date();
 
     for (const item of items) {
       const diff = Number(item.diff_qty) || 0;
@@ -654,14 +666,20 @@ async function confirmStockCount(countId) {
       const up = Number(item.unit_price_cents) || 0;
 
       if (diff > 0) {
+        const batchNo = `ADJ-${sc.id}-${iid}`;
+        const [x] = await conn.query(
+          'INSERT INTO stock_batches (canteen_id,ingredient_id,batch_no,total_qty,remaining_qty,in_date,expire_date,unit_price_cents,status) VALUES (?,?,?,?,?,?,?,?,?)',
+          [cid, iid, batchNo, diff, diff, sc.count_date, null, up, 'IN_STOCK']
+        );
+        const batchId = x.insertId;
         const [[sumRow]] = await conn.query(
           'SELECT COALESCE(SUM(remaining_qty), 0) AS total FROM stock_batches WHERE canteen_id=? AND ingredient_id=? AND status=?',
           [cid, iid, 'IN_STOCK']
         );
-        const balanceAfter = Number(sumRow.total) + diff;
+        const balanceAfter = Number(sumRow.total);
         await conn.query(
           'INSERT INTO stock_movements (canteen_id,ingredient_id,batch_id,type,qty,balance_after,unit_price_cents,ref_type,ref_id,remark) VALUES (?,?,?,?,?,?,?,?,?,?)',
-          [cid, iid, null, 'ADJUST_PLUS', diff, balanceAfter, up, 'STOCK_COUNT', countId, '盘盈调整']
+          [cid, iid, batchId, 'ADJUST_PLUS', diff, balanceAfter, up, 'STOCK_COUNT', countId, '盘盈调整']
         );
       } else {
         const [batchesRaw] = await conn.query(
@@ -672,7 +690,12 @@ async function confirmStockCount(countId) {
           [cid, iid]
         );
         const batches = batchesRaw.map(mapStockBatch);
-        const result = invLogic.fifoDeduct(batches, Math.abs(diff));
+        const result = invLogic.fifoDeduct(batches, Math.abs(diff), countDate);
+
+        if (!result.success) {
+          await conn.rollback();
+          return { error: `食材 ${iid} 库存不足，盘亏无法完成` };
+        }
 
         for (const ded of result.deductions) {
           const ub = result.updatedBatches.find(b => b.id === ded.batchId);
@@ -680,14 +703,21 @@ async function confirmStockCount(countId) {
             'UPDATE stock_batches SET remaining_qty=?, status=?, updated_at=CURRENT_TIMESTAMP(3) WHERE id=?',
             [ub.remainingQty, ub.status, ded.batchId]
           );
-          const [[sumRow]] = await conn.query(
-            'SELECT COALESCE(SUM(remaining_qty), 0) AS total FROM stock_batches WHERE canteen_id=? AND ingredient_id=? AND status=?',
-            [cid, iid, 'IN_STOCK']
-          );
+        }
+
+        let runningBalance = 0;
+        for (const ded of result.deductions) {
+          const ub = result.updatedBatches.find(b => b.id === ded.batchId);
+          runningBalance += ub.remainingQty;
+        }
+        for (let i = result.deductions.length - 1; i >= 0; i -= 1) {
+          const ded = result.deductions[i];
+          runningBalance = Math.max(0, runningBalance);
           await conn.query(
             'INSERT INTO stock_movements (canteen_id,ingredient_id,batch_id,type,qty,balance_after,unit_price_cents,ref_type,ref_id,remark) VALUES (?,?,?,?,?,?,?,?,?,?)',
-            [cid, iid, ded.batchId, 'ADJUST_MINUS', -ded.qty, Number(sumRow.total), ded.unitPriceCents, 'STOCK_COUNT', countId, '盘亏调整']
+            [cid, iid, ded.batchId, 'ADJUST_MINUS', -ded.qty, runningBalance, ded.unitPriceCents, 'STOCK_COUNT', countId, '盘亏调整']
           );
+          runningBalance += ded.qty;
         }
       }
     }
@@ -750,9 +780,185 @@ async function calcPurchaseSuggestion(canteenId, serveDate) {
   };
 }
 
+/* ----------------------------- 采购单 ----------------------------- */
+function genPurchaseOrderNo(canteenId) {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  const suffix = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+  return `PO-${canteenId}-${suffix}`;
+}
+
+async function listPurchaseOrders({ canteenId, status, startDate, endDate, keyword } = {}) {
+  const w = []; const p = [];
+  if (canteenId !== undefined) { w.push('canteen_id=?'); p.push(canteenId); }
+  if (status) { w.push('status=?'); p.push(status); }
+  if (startDate) { w.push('order_date >= ?'); p.push(startDate); }
+  if (endDate) { w.push('order_date <= ?'); p.push(endDate); }
+  if (keyword) { w.push('order_no LIKE ?'); p.push(`%${keyword}%`); }
+  const c = w.length ? `WHERE ${w.join(' AND ')}` : '';
+  const [r] = await getPool().query(`SELECT * FROM purchase_orders ${c} ORDER BY id DESC`, p);
+  return r.map(mapPurchaseOrder);
+}
+
+async function getPurchaseOrderById(id) {
+  const [r] = await getPool().query('SELECT * FROM purchase_orders WHERE id=?', [id]);
+  return mapPurchaseOrder(r[0]);
+}
+
+async function getPurchaseOrderFull(id) {
+  const po = await getPurchaseOrderById(id);
+  if (!po) return null;
+  const [items] = await getPool().query(
+    `SELECT poi.*, i.name AS ingredient_name, i.unit AS unit
+     FROM purchase_order_items poi
+     LEFT JOIN ingredients i ON i.id = poi.ingredient_id
+     WHERE poi.order_id=?
+     ORDER BY poi.id`,
+    [id]
+  );
+  return {
+    ...po,
+    items: items.map(row => ({
+      ...mapPurchaseOrderItem(row),
+      ingredientName: row.ingredient_name,
+      unit: row.unit,
+    })),
+  };
+}
+
+async function createPurchaseOrder({ canteenId, orderDate, expectedDate, remark, items }) {
+  const conn = await getPool().getConnection();
+  try {
+    await conn.beginTransaction();
+    const orderNo = genPurchaseOrderNo(canteenId);
+    const [x] = await conn.query(
+      'INSERT INTO purchase_orders (canteen_id,order_no,status,order_date,expected_date,remark) VALUES (?,?,?,?,?,?)',
+      [canteenId, orderNo, 'DRAFT', orderDate, expectedDate || null, remark || '']
+    );
+    const orderId = x.insertId;
+
+    let totalQty = 0;
+    let totalAmount = 0;
+    for (const it of items || []) {
+      const iid = Number(it.ingredientId);
+      const qty = Number(it.qty) || 0;
+      const price = Number(it.unitPriceCents) || 0;
+      const amount = Math.round(qty * price);
+      await conn.query(
+        'INSERT INTO purchase_order_items (order_id,ingredient_id,qty,unit_price_cents,amount_cents,remark) VALUES (?,?,?,?,?,?)',
+        [orderId, iid, qty, price, amount, it.remark || '']
+      );
+      totalQty += qty;
+      totalAmount += amount;
+    }
+    await conn.query(
+      'UPDATE purchase_orders SET total_qty=?, total_amount_cents=? WHERE id=?',
+      [totalQty, totalAmount, orderId]
+    );
+    await conn.commit();
+    return getPurchaseOrderFull(orderId);
+  } catch (e) {
+    await conn.rollback();
+    throw e;
+  } finally {
+    conn.release();
+  }
+}
+
+async function createPurchaseOrderFromSuggestion({ canteenId, serveDate, expectedDate, remark }) {
+  const { suggestions } = await calcPurchaseSuggestion(canteenId, serveDate);
+  const items = suggestions
+    .filter(s => s.status !== 'ENOUGH' && s.suggestOrderQty > 0)
+    .map(s => ({
+      ingredientId: s.ingredientId,
+      qty: s.suggestOrderQty,
+      unitPriceCents: 0,
+    }));
+  const orderDate = serveDate;
+  return createPurchaseOrder({ canteenId, orderDate, expectedDate, remark, items });
+}
+
+async function updatePurchaseOrderStatus(id, status) {
+  const po = await getPurchaseOrderById(id);
+  if (!po) return null;
+  await getPool().query(
+    'UPDATE purchase_orders SET status=?, updated_at=CURRENT_TIMESTAMP(3) WHERE id=?',
+    [status, id]
+  );
+  return getPurchaseOrderFull(id);
+}
+
+async function receivePurchaseItem(itemId, { qty, batchNo, expireDate, remark }) {
+  const conn = await getPool().getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [[item]] = await conn.query('SELECT * FROM purchase_order_items WHERE id=?', [itemId]);
+    if (!item) { await conn.rollback(); return null; }
+
+    const [[po]] = await conn.query('SELECT * FROM purchase_orders WHERE id=?', [item.order_id]);
+    if (!po || po.status !== 'ORDERED') {
+      await conn.rollback();
+      return { error: '采购单状态不允许收货' };
+    }
+
+    const received = Number(qty) || 0;
+    if (received <= 0) {
+      await conn.rollback();
+      return { error: '收货数量必须大于 0' };
+    }
+
+    const itemQty = Number(item.qty);
+    const itemReceived = Number(item.received_qty);
+    const remaining = itemQty - itemReceived;
+    if (received > remaining + 0.005) {
+      await conn.rollback();
+      return { error: '收货数量超过未收货数量' };
+    }
+
+    const newReceived = Math.round((itemReceived + received) * 100) / 100;
+    await conn.query(
+      'UPDATE purchase_order_items SET received_qty=? WHERE id=?',
+      [newReceived, itemId]
+    );
+
+    const batch = await stockIn({
+      canteenId: po.canteen_id,
+      ingredientId: item.ingredient_id,
+      batchNo: batchNo || `${po.order_no}-${item.ingredient_id}`,
+      qty: received,
+      inDate: new Date().toISOString().slice(0, 10),
+      expireDate: expireDate || null,
+      unitPriceCents: item.unit_price_cents,
+      remark: remark || `采购单 ${po.order_no} 收货`,
+    });
+
+    const [[allItems]] = await conn.query(
+      'SELECT COUNT(*) AS total, SUM(qty) AS total_qty, SUM(received_qty) AS total_received FROM purchase_order_items WHERE order_id=?',
+      [item.order_id]
+    );
+    const allReceived = Math.abs(allItems.total_qty - allItems.total_received) < 0.005;
+    if (allReceived) {
+      await conn.query(
+        'UPDATE purchase_orders SET status=?, updated_at=CURRENT_TIMESTAMP(3) WHERE id=?',
+        ['RECEIVED', item.order_id]
+      );
+    }
+
+    await conn.commit();
+    return { success: true, batch, item: { id: itemId, receivedQty: newReceived } };
+  } catch (e) {
+    await conn.rollback();
+    throw e;
+  } finally {
+    conn.release();
+  }
+}
+
 module.exports = {
   mapUser, mapCanteen, mapElder, mapMeal, mapOrder,
   mapIngredient, mapRecipe, mapRecipeItem, mapStockBatch, mapStockMovement, mapStockCount, mapStockCountItem,
+  mapPurchaseOrder, mapPurchaseOrderItem,
   getUserByUsername, getUserById, listUsers, createUser, updateUser, deleteUser, countUsers,
   listCanteens, getCanteenById, getCanteenByCode, createCanteen, updateCanteen, deleteCanteen,
   listElders, getElderById, getElderByCode, createElder, updateElder, deleteElder,
@@ -766,4 +972,6 @@ module.exports = {
   getStockSummaryByCanteen, getStockQty, getExpiryWarnings,
   createStockCount, listStockCounts, getStockCountById, getStockCountFull, updateStockCountItem, confirmStockCount,
   calcDemandByDate, calcPurchaseSuggestion,
+  listPurchaseOrders, getPurchaseOrderById, getPurchaseOrderFull, createPurchaseOrder,
+  createPurchaseOrderFromSuggestion, updatePurchaseOrderStatus, receivePurchaseItem,
 };

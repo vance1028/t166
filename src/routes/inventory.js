@@ -57,7 +57,7 @@ router.post('/in', requireRole('ADMIN', 'OPERATOR'), async (req, res, next) => {
 /* ----- 出库（备餐消耗）----- */
 router.post('/out', requireRole('ADMIN', 'OPERATOR'), async (req, res, next) => {
   try {
-    const { canteenId, ingredientId, qty, refType, refId, remark } = req.body || {};
+    const { canteenId, ingredientId, qty, outDate, refType, refId, remark } = req.body || {};
     if (!canteenId || !ingredientId || !qty) {
       return sendError(res, 400, '助餐点、食材、出库数量不能为空');
     }
@@ -71,9 +71,9 @@ router.post('/out', requireRole('ADMIN', 'OPERATOR'), async (req, res, next) => 
       ingredientId: Number(ingredientId),
       qty: q,
       refType: refType || 'CONSUME',
-      refId: refId ? Number(refId) : null,
+      refId: refId && !isNaN(Number(refId)) ? Number(refId) : null,
       remark: remark || '',
-      today: new Date(),
+      today: outDate ? new Date(outDate) : new Date(),
     });
 
     if (!result.success) {

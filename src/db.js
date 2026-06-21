@@ -40,10 +40,16 @@ async function resetAll() {
   try {
     await conn.query('SET FOREIGN_KEY_CHECKS = 0');
     for (const t of [
+      'purchase_order_items',
       'stock_movements', 'stock_batches',
       'stock_count_items', 'stock_counts',
-      'recipe_items', 'recipes', 'ingredients',
-      'orders', 'meals', 'elders', 'canteens', 'users',
+      'recipe_items', 'recipes',
+      'orders',
+      'meals',
+      'purchase_orders',
+      'ingredients',
+      'elders',
+      'canteens', 'users',
     ]) {
       await conn.query(`TRUNCATE TABLE ${t}`);
     }
